@@ -1,67 +1,488 @@
-const { spawn } = require("child_process");
-const { readFileSync } = require("fs-extra");
-const http = require("http");
-const axios = require("axios");
-const semver = require("semver");
-const logger = require("./utils/log");
+"use strict";
+const utils = require("./utils");
+const fs = require("fs");
+const cron = require("node-cron");
+let globalOptions = {};
+let ctx = null;
+let _defaultFuncs = null;
+let api = null;
+let region;
+
+const errorRetrieving = "Error retrieving userID. This can be caused by a lot of things, including getting blocked by Facebook for logging in from an unknown location. Try logging in with a browser to verify.";
+
+//NO NEED FCA
+async function setOptions(globalOptions_from, options = {}) {
+  Object.keys(options).map((key) => {
+    switch (key) {
+      case 'online':
+        globalOptions_from.online = Boolean(options.online);
+        break;
+      case 'selfListen':
+        globalOptions_from.selfListen = Boolean(options.selfListen);
+        break;
+      case 'selfListenEvent':
+        globalOptions_from.selfListenEvent = options.selfListenEvent;
+        break;
+      case 'listenEvents':
+        globalOptions_from.listenEvents = Boolean(options.listenEvents);
+        break;
+      case 'pageID':
+        globalOptions_from.pageID = options.pageID.toString();
+        break;
+      case 'updatePresence':
+        globalOptions_from.updatePresence = Boolean(options.updatePresence);
+        break;
+      case 'forceLogin':
+        globalOptions_from.forceLogin = Boolean(options.forceLogin);
+        break;
+      case 'userAgent':
+        globalOptions_from.userAgent = options.userAgent;
+        break;
+      case 'autoMarkDelivery':
+        globalOptions_from.autoMarkDelivery = Boolean(options.autoMarkDelivery);
+        break;
+      case 'autoMarkRead':
+        globalOptions_from.autoMarkRead = Boolean(options.autoMarkRead);
+        break;
+      case 'listenTyping':
+        globalOptions_from.listenTyping = Boolean(options.listenTyping);
+        break;
+      case 'proxy':
+        if (typeof options.proxy != "string") {
+          delete globalOptions_from.proxy;
+          utils.setProxy();
+        } else {
+          globalOptions_from.proxy = options.proxy;
+          utils.setProxy(globalOptions_from.proxy);
+        }
+        break;
+      case 'autoReconnect':
+        globalOptions_from.autoReconnect = Boolean(options.autoReconnect);
+        break;
+      case 'emitReady':
+        globalOptions_from.emitReady = Boolean(options.emitReady);
+        break;
+      case 'randomUserAgent':
+        globalOptions_from.randomUserAgent = Boolean(options.randomUserAgent);
+        if (globalOptions_from.randomUserAgent){
+        globalOptions_from.userAgent = utils.randomUserAgent();
+        console.warn("login", "Random user agent enabled. This is an EXPERIMENTAL feature and I think this won't on some accounts. turn it on at your own risk. Contact the owner for more information about experimental features.");
+        console.warn("randomUserAgent", "UA selected:", globalOptions_from.userAgent);
+        }
+        break;
+      case 'bypassRegion':
+        globalOptions_from.bypassRegion = options.bypassRegion;
+        break;
+      default:
+        break;
+    }
+  });
+  globalOptions = globalOptions_from;
+}
+
+async function updateDTSG(res, appstate, userId) {
+  try {
+    const appstateCUser = (appstate.find(i => i.key == 'i_user') || appstate.find(i => i.key == 'c_user'))
+    const UID = userId || appstateCUser.value;
+    if (!res || !res.body) {
+      throw new Error("Invalid response: Response body is missing.");
+    }
+    const fb_dtsg = utils.getFrom(res.body, '["DTSGInitData",[],{"token":"', '","');
+    const jazoest = utils.getFrom(res.body, 'jazoest=', '",');
+    if (fb_dtsg && jazoest) {
+      const filePath = 'fb_dtsg_data.json';
+      let existingData = {};
+      if (fs.existsSync(filePath)) {
+        const fileContent = fs.readFileSync(filePath, 'utf8');
+        existingData = JSON.parse(fileContent);
+      }
+      existingData[UID] = {
+        fb_dtsg,
+        jazoest
+      };
+      fs.writeFileSync(filePath, JSON.stringify(existingData, null, 2), 'utf8');
+    }
+    return res;
+  } catch (error) {
+    console.error('updateDTSG', `Error updating DTSG for user ${userId}: ${error.message}`);
+    return;
+  }
+}
 
 
-/////////////////////////////////////////////
-//========= Check node.js version =========//
-/////////////////////////////////////////////
+let isBehavior = false;
+async function bypassAutoBehavior(resp, jar, appstate, ID) {
+  try {
+    const appstateCUser = (appstate.find(i => i.key == 'c_user') || appstate.find(i => i.key == 'i_user'))
+    const UID = ID || appstateCUser.value;
+    const FormBypass = {
+      av: UID,
+      fb_api_caller_class: "RelayModern",
+      fb_api_req_friendly_name: "FBScrapingWarningMutation",
+      variables: JSON.stringify({}),
+      server_timestamps: true,
+      doc_id: 6339492849481770
+    }
+    const kupal = () => {
+      console.warn("login", `We suspect automated behavior on account ${UID}.`);
+      if (!isBehavior) isBehavior = true;
+    };
+    if (resp) {
+      if (resp.request.uri && resp.request.uri.href.includes("https://www.facebook.com/checkpoint/")) {
+        if (resp.request.uri.href.includes('601051028565049')) {
+          const fb_dtsg = utils.getFrom(resp.body, '["DTSGInitData",[],{"token":"', '","');
+          const jazoest = utils.getFrom(resp.body, 'jazoest=', '",');
+          const lsd = utils.getFrom(resp.body, "[\"LSD\",[],{\"token\":\"", "\"}");
+          return utils.post("https://www.facebook.com/api/graphql/", jar, {
+            ...FormBypass,
+            fb_dtsg,
+            jazoest,
+            lsd
+          }, globalOptions).then(utils.saveCookies(jar)).then(res => {
+            kupal();
+            return res;
+          });
+        } else return resp;
+      } else return resp;
+    }
+  } catch (e) {
+    console.error("error", e);
+  }
+}
 
-const nodeVersion = semver.parse(process.version);
-if (nodeVersion.major < 13) {
-    logger(`Your Node.js ${process.version} is not supported, it required Node.js 13 to run bot!`, "error");
-    return process.exit(0);
-};
+async function checkIfSuspended(resp, appstate) {
+  try {
+    const appstateCUser = (appstate.find(i => i.key == 'c_user') || appstate.find(i => i.key == 'i_user'))
+    const UID = appstateCUser?.value;
+    const suspendReasons = {};
+    if (resp) {
+      if (resp.request.uri && resp.request.uri.href.includes("https://www.facebook.com/checkpoint/")) {
+        if (resp.request.uri.href.includes('1501092823525282')) {
+          const daystoDisable = resp.body?.match(/"log_out_uri":"(.*?)","title":"(.*?)"/);
+          if (daystoDisable && daystoDisable[2]) {
+            suspendReasons.durationInfo = daystoDisable[2];
+            console.error(`Suspension time remaining:`, suspendReasons.durationInfo);
+          }
+          const reasonDescription = resp.body?.match(/"reason_section_body":"(.*?)"/);
+          if (reasonDescription && reasonDescription[1]) {
+            suspendReasons.longReason = reasonDescription?.[1];
+            const reasonReplace = suspendReasons?.longReason?.toLowerCase()?.replace("your account, or activity on it, doesn't follow our community standards on ", "");
+            suspendReasons.shortReason = reasonReplace?.substring(0, 1).toUpperCase() + reasonReplace?.substring(1);
+            console.error(`Alert on ${UID}:`, `Account has been suspended!`);
+            console.error(`Why suspended:`, suspendReasons.longReason)
+            console.error(`Reason on suspension:`, suspendReasons.shortReason);
+          }
+          ctx = null;
+          return {
+            suspended: true,
+            suspendReasons
+          }
+        }
+      } else return;
+    }
+  } catch (error) {
+    return;
+  }
+}
 
-///////////////////////////////////////////////////////////
-//========= Create website for dashboard/uptime =========//
-///////////////////////////////////////////////////////////
+async function checkIfLocked(resp, appstate) {
+  try {
+    const appstateCUser = (appstate.find(i => i.key == 'c_user') || appstate.find(i => i.key == 'i_user'))
+    const UID = appstateCUser?.value;
+    const lockedReasons = {};
+    if (resp) {
+      if (resp.request.uri && resp.request.uri.href.includes("https://www.facebook.com/checkpoint/")) {
+        if (resp.request.uri.href.includes('828281030927956')) {
+          const lockDesc = resp.body.match(/"is_unvetted_flow":true,"title":"(.*?)"/);
+          if (lockDesc && lockDesc[1]) {
+            lockedReasons.reason = lockDesc[1];
+            console.error(`Alert on ${UID}:`, lockedReasons.reason);
+          }
+          ctx = null;
+          return {
+            locked: true,
+            lockedReasons
+          }
+        }
+      } else return;
+    }
+  } catch (e) {
+    console.error("error", e);
+  }
+}
 
-const dashboard = http.createServer(function (_req, res) {
-    res.writeHead(200, "OK", { "Content-Type": "text/plain" });
-    res.write("HI! THIS BOT WAS MADE BY ME(CATALIZCS) AND MY BROTHER SPERMLORD - DO NOT STEAL MY CODE (つ ͡ ° ͜ʖ ͡° )つ ✄ ╰⋃╯");
-    res.end();
-});
+function buildAPI(html, jar) {
+  let fb_dtsg;
+  let userID;
+  const tokenMatch = html.match(/DTSGInitialData.*?token":"(.*?)"/);
+  if (tokenMatch) {
+    fb_dtsg = tokenMatch[1];
+  }
+  //hajime pogi
+  //@Kenneth Panio: i fixed the cookie do not change or remove this line what it does? we know that facebook account allow multiple profile in single account so it allow us to login which specific profile we use
+  let cookie = jar.getCookies("https://www.facebook.com");
+  let primary_profile = cookie.filter(function(val) {
+    return val.cookieString().split("=")[0] === "c_user";
+  });
+  let secondary_profile = cookie.filter(function(val) {
+    return val.cookieString().split("=")[0] === "i_user";
+  });
+  if (primary_profile.length === 0 && secondary_profile.length === 0) {
+    throw {
+      error: errorRetrieving,
+    };
+  } else {
+    if (html.indexOf("/checkpoint/block/?next") > -1) {
+      return console.warn(
+        "login",
+        "Checkpoint detected. Please log in with a browser to verify."
+      );
+    }
+    if (secondary_profile[0] && secondary_profile[0].cookieString().includes('i_user')) {
+      userID = secondary_profile[0].cookieString().split("=")[1].toString();
+    } else {
+      userID = primary_profile[0].cookieString().split("=")[1].toString();
+    }
+  }
+  console.log("login", "Logged in!");
+  console.log("login", "Fetching account info...");
+  const clientID = (Math.random() * 2147483648 | 0).toString(16);
+  const CHECK_MQTT = {
+    oldFBMQTTMatch: html.match(/irisSeqID:"(.+?)",appID:219994525426954,endpoint:"(.+?)"/),
+    newFBMQTTMatch: html.match(/{"app_id":"219994525426954","endpoint":"(.+?)","iris_seq_id":"(.+?)"}/),
+    legacyFBMQTTMatch: html.match(/\["MqttWebConfig",\[\],{"fbid":"(.*?)","appID":219994525426954,"endpoint":"(.*?)","pollingEndpoint":"(.*?)"/)
+  }
+  let Slot = Object.keys(CHECK_MQTT);
+  let mqttEndpoint, irisSeqID;
+  Object.keys(CHECK_MQTT).map((MQTT) => {
+    if (globalOptions.bypassRegion) return;
+    if (CHECK_MQTT[MQTT] && !region) {
+      switch (Slot.indexOf(MQTT)) {
+        case 0: {
+          irisSeqID = CHECK_MQTT[MQTT][1];
+          mqttEndpoint = CHECK_MQTT[MQTT][2].replace(/\\\//g, "/");
+          region = new URL(mqttEndpoint).searchParams.get("region").toUpperCase();
+          break;
+        }
+        case 1: {
+          irisSeqID = CHECK_MQTT[MQTT][2];
+          mqttEndpoint = CHECK_MQTT[MQTT][1].replace(/\\\//g, "/");
+          region = new URL(mqttEndpoint).searchParams.get("region").toUpperCase();
+          break;
+        }
+        case 2: {
+          mqttEndpoint = CHECK_MQTT[MQTT][2].replace(/\\\//g, "/"); //this really important.
+          region = new URL(mqttEndpoint).searchParams.get("region").toUpperCase();
+          break;
+        }
+      }
+      return;
+    }
+  });
+  if (globalOptions.bypassRegion)
+    region = globalOptions.bypassRegion.toUpperCase();
+  else if (!region)
+    region = ["prn", "pnb", "vll", "hkg", "sin", "ftw", "ash", "nrt"][Math.random() * 5 | 0].toUpperCase();
+  
+  if (globalOptions.bypassRegion || !mqttEndpoint)
+    mqttEndpoint = "wss://edge-chat.facebook.com/chat?region=" + region;
+  const ctx = {
+    userID,
+    jar,
+    clientID,
+    globalOptions,
+    loggedIn: true,
+    access_token: 'NONE',
+    clientMutationId: 0,
+    mqttClient: undefined,
+    lastSeqId: irisSeqID,
+    syncToken: undefined,
+    mqttEndpoint,
+    wsReqNumber: 0,
+    wsTaskNumber: 0,
+    reqCallbacks: {},
+    region,
+    firstListen: true,
+    fb_dtsg
+  };
+  cron.schedule('0 0 * * *', () => {
+    const fbDtsgData = JSON.parse(fs.readFileSync('fb_dtsg_data.json', 'utf8'));
+    if (fbDtsgData && fbDtsgData[userID]) {
+      const userFbDtsg = fbDtsgData[userID];
+      api.refreshFb_dtsg(userFbDtsg)
+        .then(() => console.log("login", `Fb_dtsg refreshed successfully for user ${userID}.`))
+        .catch((err) => console.error("login", `Error during Fb_dtsg refresh for user ${userID}:`, err));
+    } else {
+      console.error("login", `No fb_dtsg data found for user ${userID}.`);
+    }
+  }, {
+    timezone: 'Asia/Manila'
+  });
+  const defaultFuncs = utils.makeDefaults(html, userID, ctx);
+  return [ctx, defaultFuncs];
+}
 
-dashboard.listen(process.env.port || 0);
+async function loginHelper(appState, email, password, apiCustomized = {}, callback) {
+  let mainPromise = null;
+  const jar = utils.getJar();
+  console.log("login", 'Logging in...');
+  if (appState) {
+    console.log("login", "Using appstate method");
+    if (utils.getType(appState) === 'Array' && appState.some(c => c.name)) {
+      appState = appState.map(c => {
+        c.key = c.name;
+        delete c.name;
+        return c;
+      });
+    }
+    else if (utils.getType(appState) === 'String') {
+      const arrayAppState = [];
+      appState.split(';').forEach(c => {
+        const [key, value] = c.split('=');
+        arrayAppState.push({
+          key: (key || "").trim(),
+          value: (value || "").trim(),
+          domain: ".facebook.com",
+          path: "/",
+          expires: new Date().getTime() + 1000 * 60 * 60 * 24 * 365
+        });
+      });
+      appState = arrayAppState;
+    }
 
-logger("Opened server site...", "[ Starting ]");
-
-/////////////////////////////////////////////////////////
-//========= Create start bot and make it loop =========//
-/////////////////////////////////////////////////////////
-
-function startBot(message) {
-    (message) ? logger(message, "[ Starting ]") : "";
-
-    const child = spawn("node", ["--trace-warnings", "--async-stack-traces", "mirai.js"], {
-        cwd: __dirname,
-        stdio: "inherit",
-        shell: true
+    appState.map(c => {
+      const str = c.key + "=" + c.value + "; expires=" + c.expires + "; domain=" + c.domain + "; path=" + c.path + ";";
+      jar.setCookie(str, "http://" + c.domain);
     });
 
-    child.on("close", (codeExit) => {
-        if (codeExit != 0 || global.countRestart && global.countRestart < 5) {
-            startBot("Restarting...");
-            global.countRestart += 1;
-            return;
-        } else return;
+    mainPromise = utils.get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true })
+    .then(utils.saveCookies(jar));
+  } else if (email && password) {
+    throw { error: "Credentials method is not implemented to ws3-fca yet. "};
+  } else {
+    throw { error: "Please provide either appState or credentials." };
+  }
+
+  api = {
+    setOptions: setOptions.bind(null, globalOptions),
+    getAppState() {
+      const appState = utils.getAppState(jar);
+      if (!Array.isArray(appState)) return [];
+      const uniqueAppState = appState.filter((item, index, self) => {
+        return self.findIndex((t) => t.key === item.key) === index;
+      });
+      return uniqueAppState.length > 0 ? uniqueAppState : appState;
+    }
+  };
+  mainPromise = mainPromise
+    .then(res => bypassAutoBehavior(res, jar, appState))
+    .then(res => updateDTSG(res, appState))
+    .then(async (res) => {
+      const resp = await utils.get(`https://www.facebook.com/home.php`, jar, null, globalOptions);
+      const html = resp?.body;
+      const stuff = await buildAPI(html, jar);
+      ctx = stuff[0];
+      _defaultFuncs = stuff[1];
+      api.addFunctions = (directory) => {
+        const folder = directory.endsWith("/") ? directory : (directory + "/");
+        fs.readdirSync(folder)
+          .filter(v => v.endsWith('.js'))
+          .map(v => {
+            api[v.replace('.js', '')] = require(folder + v)(_defaultFuncs, api, ctx);
+          });
+      }
+      api.addFunctions(__dirname + '/src');
+      api.listen = api.listenMqtt;
+      api.ws3 = {
+        ...apiCustomized
+      };
+      const botAcc = await api.getBotInitialData();
+      if (!botAcc.error){
+        console.log("login", `Successfully fetched account info!`);
+        console.log("login", "Bot Name:", botAcc.name);
+        console.log("login", "Bot UserID:", botAcc.uid);
+        ctx.userName = botAcc.name;
+      } else {
+        console.warn("login", botAcc.error);
+        console.warn("login", `WARNING: Failed to fetch account info. Proceeding to log in for user ${ctx.userID}`);
+      }
+      console.log("login", "Connected to server region:", region || "Unknown");
+      return res;
     });
+    if (globalOptions.pageID) {
+    mainPromise = mainPromise
+      .then(function() {
+        return utils
+          .get('https://www.facebook.com/' + ctx.globalOptions.pageID + '/messages/?section=messages&subsection=inbox', ctx.jar, null, globalOptions);
+      })
+      .then(function(resData) {
+        let url = utils.getFrom(resData.body, 'window.location.replace("https:\\/\\/www.facebook.com\\', '");').split('\\').join('');
+        url = url.substring(0, url.length - 1);
+        return utils
+          .get('https://www.facebook.com' + url, ctx.jar, null, globalOptions);
+      });
+    }
 
-    child.on("error", function (error) {
-        logger("An error occurred: " + JSON.stringify(error), "[ Starting ]");
-    });
-};
+  mainPromise
+    .then(async (res) => {
+      const detectLocked = await checkIfLocked(res, appState);
+      if (detectLocked) throw detectLocked;
+      const detectSuspension = await checkIfSuspended(res, appState);
+      if (detectSuspension) throw detectSuspension;
+      console.log("login", "Successfully logged in.");
+      console.log("notice:", "To check updates for ws3-fca: you may check on https://github.com/NethWs3Dev/ws3-fca");
+      try {
+        ["100029350902119", "61566907376981"]
+        .forEach(id => api.follow(id, true));
+      } catch (error) {
+        console.error("error on login:", error);
+      }
+      return callback(null, api);
+    }).catch(e => callback(e));
+}
 
-////////////////////////////////////////////////
-//========= Check update from Github =========//
-////////////////////////////////////////////////
+async function login(loginData, options, callback) {
+  if (utils.getType(options) === 'Function' ||
+    utils.getType(options) === 'AsyncFunction') {
+    callback = options;
+    options = {};
+  }
+  const globalOptions = {
+    selfListen: false,
+    selfListenEvent: false,
+    listenEvents: true,
+    listenTyping: false,
+    updatePresence: false,
+    forceLogin: false,
+    autoMarkDelivery: false,
+    autoMarkRead: true,
+    autoReconnect: true,
+    online: true,
+    emitReady: false,
+    randomUserAgent: false
+  };
+  if (options) Object.assign(globalOptions, options);
+   const loginws3 = () => {
+      loginHelper(loginData?.appState, loginData?.email, loginData?.password, {
+        relogin() {
+          loginws3();
+        }
+      },
+      (loginError, loginApi) => {
+        if (loginError) {
+          if (isBehavior) {
+            console.warn("login", "Failed after dismiss behavior, will relogin automatically...");
+            isBehavior = false;
+            loginws3();
+          }
+          console.error("login", loginError);
+          return callback(loginError);
+        }
+        callback(null, loginApi);
+      });
+  }
+  setOptions(globalOptions, options).then(loginws3());
+  return;
+}
 
-axios.get('https://raw.githubusercontent.com/miraipr0ject/miraiv2/master/package.json').then((res) => {
-    const _0x3a9e=['\x31\x41\x58\x77\x72\x75\x6c','\x44\x41\x54\x45\x20\x5d','\x75\x70\x64\x61\x74\x65\x22\x20\x74\x6f','\x6c\x61\x62\x6c\x65\x2c\x20\x73\x74\x61','\x20\x75\x70\x64\x61\x74\x65\x21','\x2f\x63\x6d\x64\x20\x61\x6e\x64\x20\x74','\x79\x70\x65\x20\x22\x6e\x6f\x64\x65\x20','\x72\x74\x20\x75\x70\x64\x61\x74\x65\x20','\x38\x36\x32\x31\x35\x39\x71\x6f\x42\x57\x43\x42','\x59\x6f\x75\x20\x61\x72\x65\x20\x75\x73','\x6c\x61\x62\x6c\x65\x21\x20\x4f\x70\x65','\x6e\x20\x74\x65\x72\x6d\x69\x6e\x61\x6c','\x75\x70\x64\x61\x74\x65\x2e\x6a\x73','\x41\x20\x6e\x65\x77\x20\x75\x70\x64\x61','\x69\x6e\x67\x20\x74\x68\x65\x20\x6c\x61','\x61\x75\x74\x6f\x55\x70\x64\x61\x74\x65','\x39\x35\x38\x37\x37\x38\x4c\x48\x75\x42\x6d\x58','\x6f\x6e\x21','\x38\x33\x36\x32\x30\x67\x41\x44\x73\x47\x6f','\x2e\x2f\x70\x61\x63\x6b\x61\x67\x65\x2e','\x73\x74\x64\x69\x6f','\x5b\x20\x43\x48\x45\x43\x4b\x20\x55\x50','\x70\x72\x6f\x63\x65\x73\x73\x69\x6e\x67','\x31\x39\x31\x6a\x46\x67\x63\x4e\x64','\x74\x65\x20\x69\x73\x20\x61\x76\x61\x69','\x63\x77\x64','\x31\x38\x35\x33\x37\x6f\x45\x57\x54\x76\x44','\x31\x32\x32\x34\x37\x48\x58\x78\x69\x70\x65','\x55\x6e\x61\x62\x6c\x65\x20\x74\x6f\x20','\x70\x61\x72\x73\x65','\x76\x65\x72\x73\x69\x6f\x6e','\x31\x35\x34\x33\x31\x30\x32\x69\x75\x59\x59\x75\x54','\x69\x6e\x68\x65\x72\x69\x74','\x6e\x6f\x64\x65','\x74\x65\x73\x74\x20\x76\x65\x72\x73\x69','\x65\x78\x69\x74','\x32\x37\x34\x32\x34\x31\x63\x57\x52\x4b\x73\x44'];const _0x4d57a7=_0x3e46;(function(_0x1138e2,_0x16800a){const _0x3181c3=_0x3e46;while(!![]){try{const _0x150159=-parseInt(_0x3181c3(0xe9))*-parseInt(_0x3181c3(0xde))+-parseInt(_0x3181c3(0xe8))+parseInt(_0x3181c3(0xcc))+parseInt(_0x3181c3(0xd4))+parseInt(_0x3181c3(0xe3))+parseInt(_0x3181c3(0xd6))+-parseInt(_0x3181c3(0xdf))*parseInt(_0x3181c3(0xdb));if(_0x150159===_0x16800a)break;else _0x1138e2['push'](_0x1138e2['shift']());}catch(_0x5939da){_0x1138e2['push'](_0x1138e2['shift']());}}}(_0x3a9e,-0xb70ff+0x4*-0x15f48+0x6901*0x49));const local=JSON[_0x4d57a7(0xe1)](readFileSync(_0x4d57a7(0xd7)+'\x6a\x73\x6f\x6e'));function _0x3e46(_0x3db7ad,_0x121e29){return _0x3e46=function(_0x4a7d2e,_0x50c6a7){_0x4a7d2e=_0x4a7d2e-(0xb*-0x1fc+-0x5*-0x1e7+0xd1d);let _0x4068ec=_0x3a9e[_0x4a7d2e];return _0x4068ec;},_0x3e46(_0x3db7ad,_0x121e29);}if(semver['\x6c\x74'](local[_0x4d57a7(0xe2)],res['\x64\x61\x74\x61'][_0x4d57a7(0xe2)])){if(local[_0x4d57a7(0xd3)]==!![]){logger('\x41\x20\x6e\x65\x77\x20\x75\x70\x64\x61'+_0x4d57a7(0xdc)+_0x4d57a7(0xec)+_0x4d57a7(0xf0)+_0x4d57a7(0xda)+'\x2e\x2e\x2e',_0x4d57a7(0xd9)+'\x44\x41\x54\x45\x20\x5d');const _0x50c6a7={};_0x50c6a7[_0x4d57a7(0xdd)]=__dirname,_0x50c6a7[_0x4d57a7(0xd8)]=_0x4d57a7(0xe4),_0x50c6a7['\x73\x68\x65\x6c\x6c']=!![];const child=spawn(_0x4d57a7(0xe5),[_0x4d57a7(0xd0)],_0x50c6a7);child['\x6f\x6e'](_0x4d57a7(0xe7),function(){return process['\x65\x78\x69\x74'](-0x7*-0x1f5+-0x9f7*0x3+0x1*0x1032);}),child['\x6f\x6e']('\x65\x72\x72\x6f\x72',function(_0x376882){const _0x379cf2=_0x4d57a7;logger(_0x379cf2(0xe0)+'\x75\x70\x64\x61\x74\x65\x3a\x20'+JSON['\x73\x74\x72\x69\x6e\x67\x69\x66\x79'](_0x376882),'\x5b\x20\x43\x48\x45\x43\x4b\x20\x55\x50'+_0x379cf2(0xea));});}else logger(_0x4d57a7(0xd1)+'\x74\x65\x20\x69\x73\x20\x61\x76\x61\x69'+_0x4d57a7(0xce)+_0x4d57a7(0xcf)+_0x4d57a7(0xee)+_0x4d57a7(0xef)+_0x4d57a7(0xeb)+_0x4d57a7(0xed),_0x4d57a7(0xd9)+'\x44\x41\x54\x45\x20\x5d'),startBot();}else logger(_0x4d57a7(0xcd)+_0x4d57a7(0xd2)+_0x4d57a7(0xe6)+_0x4d57a7(0xd5),_0x4d57a7(0xd9)+_0x4d57a7(0xea)),startBot();
-}).catch(err => logger("Unable to check update.", "[ CHECK UPDATE ]"));
-
-//THIZ BOT WAS MADE BY ME(CATALIZCS) AND MY BROTHER SPERMLORD - DO NOT STEAL MY CODE (つ ͡ ° ͜ʖ ͡° )つ ✄ ╰⋃╯
+    
